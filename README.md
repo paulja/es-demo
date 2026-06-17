@@ -392,3 +392,25 @@ all projections rebuild automatically — no separate migration tool needed.
 **Separation of concerns** — the query handler and projection worker are
 completely unaware of aggregates. The command handler is completely unaware of
 Redis. The event envelope (`domain.Event`) is the only shared contract.
+
+## What has this approach got over CQRS?
+
+There are three things that CQRS alone doesn't give us:
+
+1. The event log is the only truth. There's no state row anywhere. Every aggregate's current state is derived by replaying its event history. This means Postgres is purely append-only — nothing is ever updated or deleted.
+2. Retroactive projections. Because the full history is always there, you can add a brand new read model today and backfill it from the beginning of time by replaying from global_seq = 0. In the CQRS demo, if you added a new projection, you could only populate it from events that arrive from that point forward.
+3. Optimistic concurrency without locks. The expectedVersion check means two concurrent commands on the same aggregate can't silently overwrite each other. One succeeds, one gets a 409 and retries. No database locks, no transactions spanning the whole request.
+
+Everything else — the NATS bus, Redis projections, write/read separation — we already had with CQRS.
+
+The real win is when you realise the only thing in Postgres you add is **immutable** facts about what happened, you get:
+
+- A complete audit trail for free — you never accidentally overwrite the history of an order
+- The ability to answer "what did this aggregate look like at version 3?" without any extra instrumentation
+- Confidence that your read models are derived and therefore always reconstructable — if Redis gets corrupted or a projection had a bug, nothing is lost
+
+A traditional database is a current state machine — it tells you where things are now. An event log is a record of what happened — it tells you the complete story. You can always derive the former from the latter, but you can never go the other way.
+
+Immutability is what makes the audit trail, retroactive projections, and point-in-time queries possible — they're just consequences of the same fundamental property. Nobody can go into the database and "fix" a record. The only thing you can ever do is append what happened next.
+
+In regulated industries, that's not just useful, it's often a legal requirement. But even outside of that, there's a class of production bug that simply cannot exist — the one where someone asks "how did we end up in this state?" and the answer is "we don't know, the data was overwritten."
