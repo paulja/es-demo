@@ -41,7 +41,6 @@ func (h *Handler) CreateOrder(ctx context.Context, cmd domain.CreateOrder) (stri
 		return "", fmt.Errorf("create order: %w", err)
 	}
 
-	// Persist and publish the raised events.
 	if err := h.saveAndPublish(ctx, id, order, 0); err != nil {
 		return "", err
 	}
@@ -83,16 +82,26 @@ func (h *Handler) loadOrder(ctx context.Context, id string) (*aggregate.Order, e
 	return order, nil
 }
 
-// saveAndPublish appends uncommitted events to the store then publishes each
-// one on NATS. Publication failures are non-fatal for the write side — the
-// projection worker can catch up via the global sequence on restart.
+// saveAndPublish coordinates persisting and broadcasting uncommitted events.
+// Save is fatal — if we can't write to the store the command has failed.
+// Publish is best-effort — the projection worker catches up from Postgres on
+// restart so a missed NATS message is not a data loss event.
 func (h *Handler) saveAndPublish(ctx context.Context, aggregateID string, order *aggregate.Order, expectedVersion int) error {
-	changes := order.Changes()
+	stamped, err := h.save(ctx, aggregateID, order.Changes(), expectedVersion)
+	if err != nil {
+		return err
+	}
+	h.publish(stamped)
+	return nil
+}
+
+// save stamps events with IDs and timestamps then appends them to the event
+// store. Returns the stamped events so publish receives their final form.
+func (h *Handler) save(ctx context.Context, aggregateID string, changes []domain.Event, expectedVersion int) ([]domain.Event, error) {
 	if len(changes) == 0 {
-		return nil
+		return nil, nil
 	}
 
-	// Stamp IDs and timestamps before persisting.
 	now := time.Now().UTC()
 	for i := range changes {
 		changes[i].ID = uuid.New().String()
@@ -101,17 +110,20 @@ func (h *Handler) saveAndPublish(ctx context.Context, aggregateID string, order 
 	}
 
 	if err := h.store.Append(ctx, aggregateID, changes, expectedVersion); err != nil {
-		return fmt.Errorf("append events: %w", err)
+		return nil, fmt.Errorf("append events: %w", err)
 	}
 
-	for _, e := range changes {
+	return changes, nil
+}
+
+// publish broadcasts each event on NATS. Failures are silently swallowed —
+// NATS delivery is an optimisation, not the source of truth.
+func (h *Handler) publish(events []domain.Event) {
+	for _, e := range events {
 		data, err := json.Marshal(e)
 		if err != nil {
 			continue
 		}
-		// Best-effort publish — projection worker replays from Postgres on restart.
 		_ = h.nc.Publish(e.Type, data)
 	}
-
-	return nil
 }
